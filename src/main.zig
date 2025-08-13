@@ -3,8 +3,8 @@ const std = @import("std");
 const ocap = @import("root.zig");
 
 const PairOfFds = struct {
-    a: ocap.reflection.Fd,
-    b: ocap.reflection.Fd,
+    a: ocap.Fd,
+    b: ocap.Fd,
 };
 
 pub fn main() !void {
@@ -13,8 +13,8 @@ pub fn main() !void {
     _ = args.skip();
 
     if (args.next()) |path| {
-        const conn = try ocap.unix.UnixConn.connect(path);
-        const chan = ocap.channel.Channel(ocap.reflection.Fd){ .socket = conn };
+        const conn = try ocap.UnixConn.connect(path);
+        const chan = ocap.Channel(ocap.Fd){ .socket = conn };
 
         const received = try chan.recv();
 
@@ -25,19 +25,19 @@ pub fn main() !void {
         try file.writer().print("Hello\n", .{});
     } else { // note pour le screenshot: c'est la même ligne des deux côtés
         const default_path = "/tmp/my-socket";
-        const sock = try ocap.unix.UnixListener.bind(default_path);
+        const sock = try ocap.UnixListener.bind(default_path);
         std.debug.print("listening on {s}\n", .{default_path});
 
         try sock.listen();
 
-        const s = try sock.accept();
+        while (true) {
+            const s = try sock.accept();
 
-        const chan = ocap.channel.Channel(ocap.reflection.Fd){ .socket = s };
+            const chan = ocap.Channel(ocap.Fd){ .socket = s };
 
-        try chan.send(ocap.reflection.Fd{
-            .fd = std.io.getStdOut().handle,
-        });
-
-        std.time.sleep(10_000_000_000);
+            try chan.send(ocap.Fd{
+                .fd = std.io.getStdOut().handle,
+            });
+        }
     }
 }

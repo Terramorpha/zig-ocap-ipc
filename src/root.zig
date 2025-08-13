@@ -1,3 +1,3 @@
-pub const channel = @import("./channel.zig");
-pub const unix = @import("./unix.zig");
-pub const reflection = @import("./reflection.zig");
+pub usingnamespace @import("./channel.zig");
+pub usingnamespace @import("./unix.zig");
+pub usingnamespace @import("./reflection.zig");
