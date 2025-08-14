@@ -1,0 +1,244 @@
+const std = @import("std");
+const testing = std.testing;
+const linux = std.os.linux;
+const c = std.c;
+
+const print = std.debug.print;
+
+const ucontext = @cImport({
+    @cInclude("ucontext.h");
+});
+
+/// This is to have a (relatively) easy way to allocate and deallocate the
+/// closure of some function.
+const Closure = struct {
+    data: [*]u8,
+    len: usize,
+    alignment: u29,
+
+    fn create(t: anytype, alloc: std.mem.Allocator) !@This() {
+        const T = @TypeOf(t);
+
+        const ptr = alloc.rawAlloc(
+            @sizeOf(T),
+            std.mem.Alignment.fromByteUnits(@alignOf(T)),
+            0,
+        ) orelse return std.mem.Allocator.Error.OutOfMemory;
+
+        const out: @This() = .{
+            .data = @ptrCast(ptr),
+            .len = @sizeOf(T),
+            .alignment = @alignOf(T),
+        };
+
+        out.as(T).* = t;
+        return out;
+    }
+
+    fn destroy(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.rawFree(self.data[0..self.len], std.mem.Alignment.fromByteUnits(self.alignment), 0);
+    }
+
+    fn as(self: @This(), comptime T: type) *T {
+        return @ptrCast(@alignCast(self.data));
+    }
+};
+
+pub const Runtime = struct {
+    alloc: std.mem.Allocator,
+
+    tasks: LinkedList,
+
+    sched_ctx: ?*ucontext.ucontext_t,
+
+    const LinkedList = std.DoublyLinkedList(Task);
+
+    const Task = struct {
+        const State = enum {
+            init,
+            started,
+            done,
+        };
+
+        /// The context of the task. The stack is allocated using the Runtime
+        /// allocator.
+        context: ucontext.ucontext_t,
+
+        /// The runtime this task is attached to.
+        runtime: *Runtime,
+
+        /// Its state
+        state: State = .init,
+
+        /// The closure of the function which is executed inside.
+        closure: Closure,
+
+        fn destroy(self: @This(), alloc: std.mem.Allocator) void {
+            //
+
+            const stack = self.context.uc_stack;
+
+            const stack_sp = stack.ss_sp orelse @panic("The task should have a non null stack pointer.");
+
+            const stack_sp_many: [*]u8 = @ptrCast(stack_sp);
+
+            const stack_slice = stack_sp_many[0..stack.ss_size];
+
+            alloc.free(stack_slice);
+
+            self.closure.destroy(alloc);
+        }
+
+        fn suspend_me(self: *@This()) void {
+            const sched_ctx = self.runtime.sched_ctx orelse @panic("REEE");
+
+            const result = ucontext.swapcontext(&self.context, sched_ctx);
+            if (result < 0) {
+                @panic("should be unreachable");
+            }
+        }
+    };
+
+    pub fn create(alloc: std.mem.Allocator) @This() {
+        return Runtime{
+            .alloc = alloc,
+            .tasks = LinkedList{},
+            .sched_ctx = null,
+        };
+    }
+
+    /// Free all the memory (even if the loop still has active tasks).
+    fn destroy(self: *@This()) void {
+        while (self.tasks.pop()) |node| {
+            self.alloc.destroy(node);
+        }
+    }
+
+    fn spawn(self: *@This(), thread_object: anytype) !void {
+        const node = try self.alloc.create(LinkedList.Node);
+
+        node.* = .{
+            .data = Task{
+                .context = undefined,
+                .runtime = self,
+                .state = .init,
+                .closure = try Closure.create(thread_object, self.alloc),
+            },
+            .next = null,
+            .prev = null,
+        };
+        var ctx = &node.*.data.context;
+
+        const result = ucontext.getcontext(ctx);
+        if (result < 0) {
+            return error.GetContextFailed;
+        }
+
+        ctx.*.uc_link = null;
+
+        const stack = try self.alloc.alloc(u8, 4096);
+
+        ctx.uc_stack = .{
+            .ss_flags = 0,
+            .ss_sp = stack.ptr,
+            .ss_size = stack.len,
+        };
+
+        const ThreadObject = @TypeOf(thread_object);
+
+        const NS = struct {
+            fn runTask(task: *Task) callconv(.c) void {
+                const obj: *ThreadObject = task.closure.as(ThreadObject);
+                obj.*.run(task);
+
+                const sched_ctx = task.runtime.sched_ctx orelse {
+                    @panic("There should be a pointer there.");
+                };
+
+                task.state = .done;
+
+                const r = ucontext.setcontext(sched_ctx);
+                if (r < 0) {
+                    @panic("should be unreachable unless error");
+                }
+            }
+        };
+
+        const task = &node.data;
+
+        ucontext.makecontext(ctx, @ptrCast(&NS.runTask), 1, task);
+
+        self.tasks.append(node);
+    }
+
+    fn run(self: *@This()) !void {
+        var current_ctx: ucontext.ucontext_t = undefined;
+        self.sched_ctx = &current_ctx;
+
+        while (self.tasks.popFirst()) |node| {
+            node.*.data.runtime = self;
+            node.*.data.state = .started;
+
+            const task = &node.data;
+            const task_ctx = &task.context;
+
+            const result = ucontext.swapcontext(&current_ctx, task_ctx);
+            if (result < 0) {
+                return error.SwapContextFailed;
+            }
+
+            switch (task.state) {
+                .init => {
+                    @panic("wtf");
+                },
+                .done => {
+                    task.destroy(self.alloc);
+                    self.alloc.destroy(node);
+                },
+                .started => {
+                    self.tasks.append(node);
+                },
+            }
+        }
+        self.sched_ctx = null;
+    }
+};
+
+test "some simple tests" {
+    const TestThread = struct {
+        id: usize,
+        i: *usize,
+        ids: []usize,
+
+        fn run(self: @This(), task: *Runtime.Task) void {
+            self.ids[self.i.*] = self.id;
+            self.i.* += 1;
+            task.suspend_me();
+            self.ids[self.i.*] = self.id;
+            self.i.* += 1;
+        }
+    };
+
+    var i: usize = 0;
+    var ids: [4]usize = undefined;
+
+    var rt = Runtime.create(std.testing.allocator);
+    defer rt.destroy();
+
+    const t1 = TestThread{
+        .id = 0,
+        .i = &i,
+        .ids = ids[0..],
+    };
+    const t2 = TestThread{
+        .id = 1,
+        .i = &i,
+        .ids = ids[0..],
+    };
+
+    try rt.spawn(t1);
+    try rt.spawn(t2);
+    try rt.run();
+
+    try testing.expectEqual(.{ 0, 1, 0, 1 }, ids);
+}
