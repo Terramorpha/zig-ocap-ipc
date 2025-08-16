@@ -2,12 +2,17 @@ const std = @import("std");
 const testing = std.testing;
 const linux = std.os.linux;
 const c = std.c;
-
+const uring_mod = @import("./uring.zig");
+const Uring = uring_mod.Uring;
+const UringConfig = uring_mod.UringConfig;
+const posix = std.posix;
 const print = std.debug.print;
 
 const ucontext = @cImport({
     @cInclude("ucontext.h");
 });
+
+pub usingnamespace @import("./uring.zig");
 
 /// This is to have a (relatively) easy way to allocate and deallocate the
 /// closure of some function.
@@ -19,15 +24,16 @@ const Closure = struct {
     fn create(t: anytype, alloc: std.mem.Allocator) !@This() {
         const T = @TypeOf(t);
 
+        const len = @sizeOf(T) + 1;
         const ptr = alloc.rawAlloc(
-            @sizeOf(T),
+            len,
             std.mem.Alignment.fromByteUnits(@alignOf(T)),
             0,
         ) orelse return std.mem.Allocator.Error.OutOfMemory;
 
         const out: @This() = .{
             .data = @ptrCast(ptr),
-            .len = @sizeOf(T),
+            .len = len,
             .alignment = @alignOf(T),
         };
 
@@ -44,6 +50,79 @@ const Closure = struct {
     }
 };
 
+pub const Task = struct {
+    const State = union(enum) {
+        init,
+        started,
+        waiting: struct {
+            result: *usize,
+        },
+        done,
+    };
+
+    /// The context of the task. The stack is allocated using the Runtime
+    /// allocator.
+    context: ucontext.ucontext_t,
+
+    /// The runtime this task is attached to.
+    runtime: *Runtime,
+
+    /// Its state
+    state: State = .init,
+
+    /// The closure of the function which is executed inside.
+    closure: Closure,
+
+    fn destroy(self: @This(), alloc: std.mem.Allocator) void {
+        const stack = self.context.uc_stack;
+
+        const stack_sp = stack.ss_sp orelse @panic("The task should have a non null stack pointer.");
+
+        const stack_sp_many: [*]u8 = @ptrCast(stack_sp);
+
+        const stack_slice = stack_sp_many[0..stack.ss_size];
+
+        alloc.free(stack_slice);
+
+        self.closure.destroy(alloc);
+    }
+
+    fn suspend_me(self: *@This()) void {
+        const sched_ctx = self.runtime.sched_ctx orelse @panic("REEE");
+
+        const result = ucontext.swapcontext(&self.context, sched_ctx);
+        if (result < 0) {
+            @panic("should be unreachable");
+        }
+    }
+
+    pub fn read(self: *@This(), fd: posix.fd_t, buffer: []u8) !usize {
+        var uring = self.runtime.uring;
+        var result: usize = undefined;
+        self.state = .{ .waiting = .{ .result = &result } };
+
+        try uring.put_fd_buffer(.READ, fd, buffer, self);
+
+        const parent = self.runtime.sched_ctx orelse @panic("stuff");
+        _ = ucontext.swapcontext(&self.context, parent);
+
+        return result;
+    }
+
+    pub fn write(self: *@This(), fd: posix.fd_t, buffer: []const u8) !usize {
+        var uring = self.runtime.uring;
+        var result: usize = undefined;
+        self.state = .{ .waiting = .{ .result = &result } };
+
+        try uring.put_fd_buffer(.WRITE, fd, @constCast(buffer), self);
+
+        const parent = self.runtime.sched_ctx orelse @panic("stuff");
+        _ = ucontext.swapcontext(&self.context, parent);
+
+        return result;
+    }
+};
+
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
 
@@ -51,70 +130,36 @@ pub const Runtime = struct {
 
     sched_ctx: ?*ucontext.ucontext_t,
 
+    uring: *TheUring,
+
+    const TheUring = Uring(*Task, .{});
+
     const LinkedList = std.DoublyLinkedList(Task);
 
-    const Task = struct {
-        const State = enum {
-            init,
-            started,
-            done,
-        };
+    pub fn create(alloc: std.mem.Allocator) !@This() {
+        const uring = try alloc.create(TheUring);
+        errdefer alloc.destroy(uring);
 
-        /// The context of the task. The stack is allocated using the Runtime
-        /// allocator.
-        context: ucontext.ucontext_t,
+        uring.* = try Uring(*Task, .{}).create();
 
-        /// The runtime this task is attached to.
-        runtime: *Runtime,
-
-        /// Its state
-        state: State = .init,
-
-        /// The closure of the function which is executed inside.
-        closure: Closure,
-
-        fn destroy(self: @This(), alloc: std.mem.Allocator) void {
-            //
-
-            const stack = self.context.uc_stack;
-
-            const stack_sp = stack.ss_sp orelse @panic("The task should have a non null stack pointer.");
-
-            const stack_sp_many: [*]u8 = @ptrCast(stack_sp);
-
-            const stack_slice = stack_sp_many[0..stack.ss_size];
-
-            alloc.free(stack_slice);
-
-            self.closure.destroy(alloc);
-        }
-
-        fn suspend_me(self: *@This()) void {
-            const sched_ctx = self.runtime.sched_ctx orelse @panic("REEE");
-
-            const result = ucontext.swapcontext(&self.context, sched_ctx);
-            if (result < 0) {
-                @panic("should be unreachable");
-            }
-        }
-    };
-
-    pub fn create(alloc: std.mem.Allocator) @This() {
         return Runtime{
             .alloc = alloc,
             .tasks = LinkedList{},
             .sched_ctx = null,
+            .uring = uring,
         };
     }
 
     /// Free all the memory (even if the loop still has active tasks).
-    fn destroy(self: *@This()) void {
+    pub fn destroy(self: *@This()) void {
         while (self.tasks.pop()) |node| {
             self.alloc.destroy(node);
         }
+
+        self.alloc.destroy(self.uring);
     }
 
-    fn spawn(self: *@This(), thread_object: anytype) !void {
+    pub fn spawn(self: *@This(), thread_object: anytype) !void {
         const node = try self.alloc.create(LinkedList.Node);
 
         node.* = .{
@@ -136,7 +181,7 @@ pub const Runtime = struct {
 
         ctx.*.uc_link = null;
 
-        const stack = try self.alloc.alloc(u8, 4096);
+        const stack = try self.alloc.alloc(u8, 1 << 13);
 
         ctx.uc_stack = .{
             .ss_flags = 0,
@@ -171,38 +216,80 @@ pub const Runtime = struct {
         self.tasks.append(node);
     }
 
-    fn run(self: *@This()) !void {
+    fn empty_uring(self: *@This()) !void {
+        while (self.uring.completion_queue.get()) |cqe| {
+            const id: u32 = @intCast(cqe.user_data);
+            const task = self.uring.sqe_data[id];
+            // give back the id
+            try self.uring.sqe_freelist.append(id);
+
+            switch (task.state) {
+                .waiting => |r| {
+                    r.result.* = @intCast(cqe.res);
+
+                    task.state = .started;
+
+                    // The task is intrusive in a linked list node.
+                    const node: *LinkedList.Node = @fieldParentPtr("data", task);
+
+                    self.tasks.append(node);
+                },
+                else => @panic("weird case"),
+            }
+        }
+    }
+
+    pub fn run(self: *@This()) !void {
         var current_ctx: ucontext.ucontext_t = undefined;
         self.sched_ctx = &current_ctx;
 
-        while (self.tasks.popFirst()) |node| {
-            node.*.data.runtime = self;
-            node.*.data.state = .started;
+        while (true) {
+            while (self.tasks.popFirst()) |node| {
+                node.*.data.runtime = self;
+                node.*.data.state = .started;
 
-            const task = &node.data;
-            const task_ctx = &task.context;
+                const task = &node.data;
+                const task_ctx = &task.context;
 
-            const result = ucontext.swapcontext(&current_ctx, task_ctx);
-            if (result < 0) {
-                return error.SwapContextFailed;
+                const result = ucontext.swapcontext(&current_ctx, task_ctx);
+                if (result < 0) {
+                    return error.SwapContextFailed;
+                }
+
+                switch (task.state) {
+                    .init => {
+                        @panic("wtf");
+                    },
+                    .started => {
+                        self.tasks.append(node);
+                    },
+                    .waiting => {
+                        // Do nothing. The thread will be resumed when emptying the
+                        // uring.
+                    },
+                    .done => {
+                        task.destroy(self.alloc);
+                        self.alloc.destroy(node);
+                    },
+                }
             }
 
-            switch (task.state) {
-                .init => {
-                    @panic("wtf");
-                },
-                .done => {
-                    task.destroy(self.alloc);
-                    self.alloc.destroy(node);
-                },
-                .started => {
-                    self.tasks.append(node);
-                },
+            try self.empty_uring();
+
+            if (self.tasks.len != 0) continue;
+
+            if (self.uring.in_flight() != 0) {
+                _ = try self.uring.enter(0, 1);
+                continue;
             }
+
+            break;
         }
         self.sched_ctx = null;
     }
 };
+
+const testing_utils = @import("./testing.zig");
 
 test "some simple tests" {
     const TestThread = struct {
@@ -210,7 +297,7 @@ test "some simple tests" {
         i: *usize,
         ids: []usize,
 
-        fn run(self: @This(), task: *Runtime.Task) void {
+        fn run(self: @This(), task: *Task) void {
             self.ids[self.i.*] = self.id;
             self.i.* += 1;
             task.suspend_me();
@@ -222,7 +309,7 @@ test "some simple tests" {
     var i: usize = 0;
     var ids: [4]usize = undefined;
 
-    var rt = Runtime.create(std.testing.allocator);
+    var rt = try Runtime.create(std.testing.allocator);
     defer rt.destroy();
 
     const t1 = TestThread{
@@ -241,4 +328,25 @@ test "some simple tests" {
     try rt.run();
 
     try testing.expectEqual(.{ 0, 1, 0, 1 }, ids);
+}
+
+test "read" {
+    var rt = try Runtime.create(std.testing.allocator);
+    defer rt.destroy();
+
+    const thing = struct {
+        fn run(_: @This(), task: *Task) void {
+            var buf: [16]u8 = undefined;
+            const file = testing_utils.pipeWithText("hello!!!") catch @panic("asdf");
+            const handle = file.handle;
+
+            buf[0] = 0;
+
+            _ = task.read(handle, buf[0..]) catch
+                @panic("");
+        }
+    }{};
+
+    try rt.spawn(thing);
+    try rt.run();
 }
