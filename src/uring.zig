@@ -5,10 +5,6 @@ const linux = std.os.linux;
 const testing = std.testing;
 const testing_utils = @import("./testing.zig");
 
-pub const UringConfig = struct {
-    max_sqe_size: usize = 1 << 10,
-};
-
 /// A common type made to use the in mmaped queue from io_uring.
 fn Queue(comptime T: type) type {
     return struct {
@@ -37,6 +33,10 @@ fn Queue(comptime T: type) type {
         }
     };
 }
+
+pub const UringConfig = struct {
+    max_sqe_size: usize = 1 << 10,
+};
 
 pub fn Uring(comptime T: type, comptime config: UringConfig) type {
     return struct {

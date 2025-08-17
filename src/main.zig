@@ -9,7 +9,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 25 }){};
     const allocator = gpa.allocator();
     {
-        var rt = try ocap.Runtime.create(allocator);
+        var rt = try ocap.Runtime.create(allocator, .{});
         defer rt.destroy();
 
         const thing = struct {
@@ -19,6 +19,12 @@ pub fn main() !void {
                 const n = task.write(stdout, "salut\n") catch
                     @panic("");
                 std.debug.print("n: {}\n", .{n});
+
+                for (0..1_000_000_000) |i| {
+                    if (@mod(i, 1_000_000) == 0) {
+                        std.debug.print("i: {}\n", .{i});
+                    }
+                }
             }
         }{};
 
